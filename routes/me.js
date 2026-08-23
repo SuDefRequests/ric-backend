@@ -1,45 +1,79 @@
 const express = require('express');
 const router = express.Router();
-const pool = require('../db');
+const supabase = require('../db');
 const requireAuth = require('../middleware/requireAuth');
 
-// 1. Get current logged-in user profile
+// GET /api/me
 router.get('/', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query(
-      `select user_id, branch, year, full_name, roll_no, mobile_no, created_at from user_profiles where user_id = $1`,
-      [req.user.id]
-    );
-    if (result.rows.length === 0) {
-      return res.json({ profile: null, email: req.user.email });
-    }
-    res.json({ profile: result.rows[0], email: req.user.email });
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: profile, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ profile: profile || null });
   } catch (err) {
-    console.error('Error fetching user profile:', err);
-    res.status(500).json({ error: 'Failed to fetch user profile' });
+    return res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
-// 2. Save/Update current user profile (Upsert)
+// POST /api/me - Upsert User Profile
+// POST /api/me - Upsert User Profile
 router.post('/', requireAuth, async (req, res) => {
-  const { branch, year, full_name, roll_no, mobile_no } = req.body;
-  if (!branch || !year || !full_name) {
-    return res.status(400).json({ error: 'Name, Branch, and Year are required' });
-  }
-
   try {
-    const result = await pool.query(
-      `insert into user_profiles (user_id, branch, year, full_name, roll_no, mobile_no)
-       values ($1, $2, $3, $4, $5, $6)
-       on conflict (user_id)
-       do update set branch = $2, year = $3, full_name = $4, roll_no = $5, mobile_no = $6
-       returning *`,
-      [req.user.id, branch, year, full_name, roll_no, mobile_no]
-    );
-    res.json(result.rows[0]);
+    const userId = req.user?.id;
+    const userEmail = req.user?.email;
+
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { full_name, branch, year, roll_no, mobile_no, phone, pitch, tags, skills, is_public } = req.body;
+
+    let tagsArray = [];
+    if (Array.isArray(tags)) {
+      tagsArray = tags;
+    } else if (typeof tags === 'string') {
+      tagsArray = tags.split(',').map((t) => t.trim().toUpperCase()).filter(Boolean);
+    } else if (typeof skills === 'string') {
+      tagsArray = skills.split(',').map((t) => t.trim().toUpperCase()).filter(Boolean);
+    }
+
+    const contactVal = mobile_no || phone || null;
+
+    const payload = {
+      id: userId,
+      email: userEmail,
+      full_name: full_name || null,
+      branch: branch || null,
+      year: year || null,
+      roll_no: roll_no || null,
+      phone: contactVal,
+      mobile_no: contactVal,
+      pitch: pitch || null,
+      tags: tagsArray,
+      is_public: is_public !== undefined ? Boolean(is_public) : true,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .upsert(payload)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Profile upsert error:', error);
+      return res.status(400).json({ error: error.message });
+    }
+
+    return res.json({ profile: data });
   } catch (err) {
-    console.error('Error saving user profile:', err);
-    res.status(500).json({ error: 'Failed to save profile' });
+    console.error('Server error in POST /api/me:', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 

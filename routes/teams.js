@@ -1,272 +1,369 @@
 const express = require('express');
 const router = express.Router();
-const pool = require('../db');
+const supabase = require('../db');
 const requireAuth = require('../middleware/requireAuth');
 
-// ── 1. List teams (Registered Teams tab) ──────────────────────────────
+
+
+// ── 1. List teams ───────────────────────────────────────────────
 router.get('/', async (req, res) => {
   const { competition_id } = req.query;
   try {
-    const teamsResult = await pool.query(
-      `select t.*, c.name as competition_name 
-       from teams t join competitions c on c.id = t.competition_id 
-       ${competition_id ? 'where t.competition_id = $1' : ''} 
-       order by t.created_at desc`,
-      competition_id ? [competition_id] : []
-    );
-    
-    const teamIds = teamsResult.rows.map(t => t.id);
-    let membersByTeam = {};
-    let memberIdsByTeam = {};
-    
-    if (teamIds.length > 0) {
-      // Bulletproof Subquery: Gets real names instead of Gmail IDs
-      const membersResult = await pool.query(
-        `SELECT tm.team_id, tm.user_id, 
-          COALESCE((SELECT full_name FROM profiles WHERE id = tm.user_id LIMIT 1), u.email) as display_name 
-         FROM team_members tm 
-         JOIN auth.users u ON u.id = tm.user_id 
-         WHERE tm.team_id = any($1::uuid[])`,
-        [teamIds]
-      );
-      membersResult.rows.forEach(r => {
-        (membersByTeam[r.team_id] ||= []).push(r.display_name);
-        (memberIdsByTeam[r.team_id] ||= []).push(r.user_id);
+    let teamsQuery = supabase
+      .from('teams')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (competition_id) {
+      teamsQuery = teamsQuery.eq('competition_id', competition_id);
+    }
+
+    const { data: teams, error: teamsError } = await teamsQuery;
+    if (teamsError) return res.status(500).json({ error: teamsError.message });
+    if (!teams || teams.length === 0) return res.json([]);
+
+    const teamIds = teams.map((t) => t.id);
+
+    const { data: membersData } = await supabase
+      .from('team_members')
+      .select('team_id, user_id')
+      .in('team_id', teamIds);
+
+    const userIds = [...new Set((membersData || []).map((m) => m.user_id))];
+
+    let profilesMap = {};
+    if (userIds.length > 0) {
+      const { data: profilesData } = await supabase
+        .from('profiles')
+        .select('id, full_name, email')
+        .in('id', userIds);
+
+      (profilesData || []).forEach((p) => {
+        profilesMap[p.id] = p.full_name || p.email;
       });
     }
 
-    const teams = teamsResult.rows.map(t => ({ 
-      ...t, 
-      members_names: membersByTeam[t.id] || [], 
-      members_ids: memberIdsByTeam[t.id] || []
+    const membersByTeam = {};
+    const memberIdsByTeam = {};
+
+    (membersData || []).forEach((m) => {
+      if (!membersByTeam[m.team_id]) membersByTeam[m.team_id] = [];
+      if (!memberIdsByTeam[m.team_id]) memberIdsByTeam[m.team_id] = [];
+
+      membersByTeam[m.team_id].push(profilesMap[m.user_id] || 'Team Member');
+      memberIdsByTeam[m.team_id].push(m.user_id);
+    });
+
+    const formattedTeams = teams.map((t) => ({
+      ...t,
+      competition_name: t.competition_name || 'Hackathon / SIH 2026',
+      members_names: membersByTeam[t.id] || [],
+      members_ids: memberIdsByTeam[t.id] || [],
     }));
-    res.json(teams);
+
+    return res.json(formattedTeams);
   } catch (err) {
-    console.error("List Error:", err);
-    res.status(500).json({ error: 'Could not load teams' });
+    console.error('List Error:', err);
+    return res.status(500).json({ error: 'Could not load teams' });
   }
 });
 
-// ── 2. Create a team ────────────────────────────────────────────────
+
+// ── 2. Create a recruiting team/squad ────────────────────────────
+// POST /api/teams
 router.post('/', requireAuth, async (req, res) => {
-  const { competition_id, name, needed_skills } = req.body;
-  if (!competition_id || !name) {
-    return res.status(400).json({ error: 'competition_id and name are required' });
+  const { name, needed_skills, target_size, competition_name } = req.body;
+  if (!name) {
+    return res.status(400).json({ error: 'Team name is required.' });
   }
 
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
+    const { data: comps } = await supabase.from('competitions').select('id').limit(1);
+    const compId = comps && comps.length > 0 ? comps[0].id : null;
 
-    const teamResult = await client.query(
-      `insert into teams (competition_id, name, created_by, needed_skills)
-       values ($1, $2, $3, $4) returning *`,
-      [competition_id, name, req.user.id, needed_skills || []]
-    );
-    const team = teamResult.rows[0];
+    const insertPayload = {
+      name,
+      created_by: req.user.id,
+      needed_skills: Array.isArray(needed_skills) ? needed_skills : [],
+      target_size: Number(target_size) || 6,
+      status: 'open',
+    };
+    if (compId) insertPayload.competition_id = compId;
 
-    await client.query(
-      `insert into team_members (team_id, user_id, competition_id) values ($1, $2, $3)`,
-      [team.id, req.user.id, competition_id]
-    );
+    const { data: team, error: teamError } = await supabase
+      .from('teams')
+      .insert(insertPayload)
+      .select()
+      .single();
 
-    await client.query('COMMIT');
-    res.status(201).json(team);
-  } catch (err) {
-    await client.query('ROLLBACK');
-    if (err.code === '23505') {
-      return res.status(409).json({ error: "You're already on a team for this competition" });
+    if (teamError) {
+      return res.status(400).json({ error: teamError.message });
     }
-    console.error(err);
-    res.status(500).json({ error: 'Could not create team' });
-  } finally {
-    client.release();
+
+    // Add creator as initial member
+    await supabase.from('team_members').insert({
+      team_id: team.id,
+      user_id: req.user.id,
+      competition_id: compId,
+    });
+
+    return res.status(201).json(team);
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error creating team' });
+  }
+});
+    
+
+// ── Outgoing requests sent by the logged-in user ──────────────────
+router.get('/my-requests', requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // 1. Fetch user's join requests
+    const { data: requests, error: reqError } = await supabase
+      .from('join_requests')
+      .select('id, team_id, status, created_at')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (reqError) {
+      console.error('Join requests error:', reqError.message);
+      return res.json([]);
+    }
+
+    if (!requests || requests.length === 0) {
+      return res.json([]);
+    }
+
+    // 2. Fetch all teams corresponding to these requests
+    const teamIds = [...new Set(requests.map((r) => r.team_id).filter(Boolean))];
+    
+    let teamsMap = {};
+    if (teamIds.length > 0) {
+      const { data: teamsData, error: teamsError } = await supabase
+        .from('teams')
+        .select('*')
+        .in('id', teamIds);
+
+      if (!teamsError && teamsData) {
+        teamsData.forEach((t) => {
+          teamsMap[String(t.id)] = t;
+        });
+      }
+    }
+
+    // 3. Map actual team details to each request
+    const formatted = requests.map((r) => {
+      const matchedTeam = teamsMap[String(r.team_id)];
+      return {
+        id: r.id,
+        team_id: r.team_id,
+        status: r.status,
+        created_at: r.created_at,
+        teams: {
+          name: matchedTeam?.name || matchedTeam?.team_name || 'Recruiting Squad',
+          competition_name: matchedTeam?.competition_name || 'SIH 2026',
+        },
+      };
+    });
+
+    return res.json(formatted);
+  } catch (err) {
+    console.error('Fetch my requests error:', err);
+    return res.json([]);
   }
 });
 
-// ── 3. Request to join a team ──────────────────────────────────────
+// ── 3. Update squad status / needed skills (Creator only) ─────────
+router.patch('/:id', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const { status, needed_skills, name } = req.body;
+
+  try {
+    const { data: team } = await supabase
+      .from('teams')
+      .select('created_by')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (!team) return res.status(404).json({ error: 'Team not found' });
+    if (team.created_by !== req.user.id) {
+      return res.status(403).json({ error: 'Unauthorized: Only the creator can edit this team' });
+    }
+
+    const updates = {};
+    if (status !== undefined) updates.status = status;
+    if (needed_skills !== undefined) updates.needed_skills = needed_skills;
+    if (name !== undefined) updates.name = name;
+
+    const { data, error } = await supabase
+      .from('teams')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) return res.status(400).json({ error: error.message });
+    return res.json(data);
+  } catch (err) {
+    return res.status(500).json({ error: 'Could not update team' });
+  }
+});
+
+// ── 4. Request to join ───────────────────────────────────────────
 router.post('/:id/request', requireAuth, async (req, res) => {
   const { id } = req.params;
   try {
-    const teamResult = await pool.query(`select * from teams where id = $1`, [id]);
-    if (teamResult.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
-    const team = teamResult.rows[0];
-    if (team.status !== 'open') return res.status(400).json({ error: 'This team is not accepting members' });
+    const { data: team } = await supabase
+      .from('teams')
+      .select('status, competition_id')
+      .eq('id', id)
+      .maybeSingle();
 
-    await pool.query(
-      `insert into join_requests (team_id, user_id, competition_id) values ($1, $2, $3)`,
-      [id, req.user.id, team.competition_id]
-    );
-    res.status(201).json({ status: 'requested' });
-  } catch (err) {
-    if (err.code === '23505') {
-      return res.status(409).json({ error: 'You already have a pending request for this team' });
+    if (!team) return res.status(404).json({ error: 'Team not found' });
+    if (team.status !== 'open') {
+      return res.status(400).json({ error: 'This squad is closed or locked for new members.' });
     }
-    console.error(err);
-    res.status(500).json({ error: 'Could not send join request' });
+
+    const { error: insertError } = await supabase.from('join_requests').insert({
+      team_id: id,
+      user_id: req.user.id,
+      competition_id: team.competition_id,
+      status: 'pending',
+    });
+
+    if (insertError) {
+      if (insertError.code === '23505') {
+        return res.status(409).json({ error: 'You already requested to join this team.' });
+      }
+      return res.status(400).json({ error: insertError.message });
+    }
+
+    return res.status(201).json({ status: 'requested' });
+  } catch (err) {
+    return res.status(500).json({ error: 'Could not send join request' });
   }
 });
 
-// ── 4. View pending requests (team creator only) ───────────────────
+// ── 5. View pending requests ─────────────────────────────────────
 router.get('/:id/requests', requireAuth, async (req, res) => {
   const { id } = req.params;
   try {
-    const team = await pool.query(`select created_by from teams where id = $1`, [id]);
-    if (team.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
-    if (team.rows[0].created_by !== req.user.id) {
-      return res.status(403).json({ error: 'Only the team creator can view requests' });
+    const { data: team } = await supabase
+      .from('teams')
+      .select('created_by')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (!team || team.created_by !== req.user.id) {
+      return res.status(403).json({ error: 'Unauthorized' });
     }
 
-    // Bulletproof Subquery: Gets real names for the requests panel
-    const result = await pool.query(
-      `SELECT jr.id, jr.status, jr.created_at, 
-        COALESCE((SELECT full_name FROM profiles WHERE id = jr.user_id LIMIT 1), u.email) as email
-       FROM join_requests jr 
-       JOIN auth.users u ON u.id = jr.user_id
-       WHERE jr.team_id = $1 AND jr.status = 'pending'
-       ORDER BY jr.created_at ASC`,
-      [id]
-    );
-    res.json(result.rows);
+    const { data: requests, error } = await supabase
+      .from('join_requests')
+      .select('id, status, created_at, user_id')
+      .eq('team_id', id)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true });
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    const userIds = (requests || []).map((r) => r.user_id);
+    let profilesMap = {};
+
+    if (userIds.length > 0) {
+      const { data: profilesData } = await supabase
+        .from('profiles')
+        .select('*')
+        .in('id', userIds);
+
+      (profilesData || []).forEach((p) => {
+        profilesMap[p.id] = p;
+      });
+    }
+
+    const formatted = (requests || []).map((r) => ({
+      id: r.id,
+      status: r.status,
+      created_at: r.created_at,
+      email: profilesMap[r.user_id]?.full_name || profilesMap[r.user_id]?.email || 'Applicant',
+      details: profilesMap[r.user_id] || null,
+    }));
+
+    return res.json(formatted);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Could not load requests' });
+    return res.status(500).json({ error: 'Could not load requests' });
   }
 });
 
-// ── 5. Accept / reject a request (team creator only) ────────────────
+// ── 6. Accept / Reject Request ───────────────────────────────────
 router.post('/:id/requests/:requestId/:decision', requireAuth, async (req, res) => {
   const { id, requestId, decision } = req.params;
   if (!['accept', 'reject'].includes(decision)) {
-    return res.status(400).json({ error: 'decision must be accept or reject' });
+    return res.status(400).json({ error: 'Invalid decision' });
   }
 
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
+    const { data: team } = await supabase
+      .from('teams')
+      .select('created_by, competition_id')
+      .eq('id', id)
+      .maybeSingle();
 
-    const teamResult = await client.query(`select * from teams where id = $1 for update`, [id]);
-    if (teamResult.rows.length === 0) throw { status: 404, message: 'Team not found' };
-    const team = teamResult.rows[0];
-    if (team.created_by !== req.user.id) throw { status: 403, message: 'Only the team creator can decide requests' };
+    if (!team || team.created_by !== req.user.id) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
 
-    const reqResult = await client.query(
-      `select * from join_requests where id = $1 and team_id = $2 and status = 'pending'`,
-      [requestId, id]
-    );
-    if (reqResult.rows.length === 0) throw { status: 404, message: 'Request not found or already decided' };
-    const joinReq = reqResult.rows[0];
+    const { data: joinReq } = await supabase
+      .from('join_requests')
+      .select('*')
+      .eq('id', requestId)
+      .eq('team_id', id)
+      .eq('status', 'pending')
+      .maybeSingle();
+
+    if (!joinReq) return res.status(404).json({ error: 'Request not found' });
 
     if (decision === 'accept') {
-      await client.query(
-        `insert into team_members (team_id, user_id, competition_id) values ($1, $2, $3)`,
-        [id, joinReq.user_id, joinReq.competition_id]
-      );
+      await supabase.from('team_members').insert({
+        team_id: id,
+        user_id: joinReq.user_id,
+        competition_id: team.competition_id,
+      });
     }
 
-    await client.query(
-      `update join_requests set status = $1 where id = $2`,
-      [decision === 'accept' ? 'accepted' : 'rejected', requestId]
-    );
+    await supabase
+      .from('join_requests')
+      .update({ status: decision === 'accept' ? 'accepted' : 'rejected' })
+      .eq('id', requestId);
 
-    await client.query('COMMIT');
-    res.json({ status: decision });
+    return res.json({ status: decision });
   } catch (err) {
-    await client.query('ROLLBACK');
-    if (err.code === '23505') {
-      return res.status(409).json({ error: 'That person joined a different team for this competition in the meantime' });
-    }
-    if (err.status) return res.status(err.status).json({ error: err.message });
-    console.error(err);
-    res.status(500).json({ error: 'Could not process request' });
-  } finally {
-    client.release();
+    return res.status(500).json({ error: 'Could not process request' });
   }
 });
 
-// ── 6. Leave a team ──────────────────────────────────────────────────
-router.post('/:id/leave', requireAuth, async (req, res) => {
-  const { id } = req.params;
-  try {
-    const team = await pool.query(`select created_by from teams where id = $1`, [id]);
-    if (team.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
-    if (team.rows[0].created_by === req.user.id) {
-      return res.status(400).json({ error: 'Transfer leadership or delete the team before leaving' });
-    }
-
-    await pool.query(`delete from team_members where team_id = $1 and user_id = $2`, [id, req.user.id]);
-    res.json({ status: 'left' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Could not leave team' });
-  }
-});
-
-// ── 7. Transfer leadership ───────────────────────────────────────────
-router.post('/:id/transfer', requireAuth, async (req, res) => {
-  const { id } = req.params;
-  const { new_leader_id } = req.body;
-  try {
-    const team = await pool.query(`select created_by from teams where id = $1`, [id]);
-    if (team.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
-    if (team.rows[0].created_by !== req.user.id) {
-      return res.status(403).json({ error: 'Only the current leader can transfer leadership' });
-    }
-
-    const member = await pool.query(
-      `select 1 from team_members where team_id = $1 and user_id = $2`,
-      [id, new_leader_id]
-    );
-    if (member.rows.length === 0) {
-      return res.status(400).json({ error: 'New leader must already be a team member' });
-    }
-
-    await pool.query(`update teams set created_by = $1 where id = $2`, [new_leader_id, id]);
-    res.json({ status: 'transferred' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Could not transfer leadership' });
-  }
-});
-
-// ── 8. Delete a team (creator only) ──────────────────────────────────
+// ── 7. Delete Team ───────────────────────────────────────────────
 router.delete('/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
   try {
-    const team = await pool.query(`select created_by from teams where id = $1`, [id]);
-    if (team.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
-    if (team.rows[0].created_by !== req.user.id) {
-      return res.status(403).json({ error: 'Only the team creator can delete the team' });
-    }
-    await pool.query(`delete from teams where id = $1`, [id]);
-    res.json({ status: 'deleted' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Could not delete team' });
-  }
-});
+    const { data: team } = await supabase
+      .from('teams')
+      .select('created_by')
+      .eq('id', id)
+      .maybeSingle();
 
-// ── 9. Update status / needed_skills (creator only) ──────────────────
-router.patch('/:id', requireAuth, async (req, res) => {
-  const { id } = req.params;
-  const { status, needed_skills } = req.body;
-  try {
-    const team = await pool.query(`select created_by from teams where id = $1`, [id]);
-    if (team.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
-    if (team.rows[0].created_by !== req.user.id) {
-      return res.status(403).json({ error: 'Only the team creator can update the team' });
+    if (!team || team.created_by !== req.user.id) {
+      return res.status(403).json({ error: 'Unauthorized' });
     }
-    const result = await pool.query(
-      `update teams set
-        status = coalesce($1, status),
-        needed_skills = coalesce($2, needed_skills)
-       where id = $3 returning *`,
-      [status || null, needed_skills || null, id]
-    );
-    res.json(result.rows[0]);
+
+    await supabase.from('join_requests').delete().eq('team_id', id);
+    await supabase.from('team_members').delete().eq('team_id', id);
+    await supabase.from('teams').delete().eq('id', id);
+
+    return res.json({ status: 'deleted' });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Could not update team' });
+    return res.status(500).json({ error: 'Could not delete team' });
   }
 });
 
