@@ -1,0 +1,47 @@
+require('dotenv').config();
+
+const express = require('express');
+const cors = require('cors');
+
+// 1. Import all routers
+const profilesRouter = require('./routes/profiles');
+const competitionsRouter = require('./routes/competitions');
+const meRouter = require('./routes/me');
+const teamsRouter = require('./routes/teams');
+const adminRouter = require('./routes/admin');
+const eventsRouter = require('./routes/events');
+const sihRouter = require('./routes/sih');
+const aavishkarRouter = require('./routes/aavishkar');
+
+
+
+const app = express();
+
+// 2. Global Middleware & CORS Setup
+app.use(
+  cors({
+    origin: '*',
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
+
+app.use(express.json());
+
+// 3. Health Check
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+// 4. Register all API Routes
+app.use('/api/profiles', profilesRouter);
+app.use('/api/competitions', competitionsRouter);
+app.use('/api/me', meRouter);
+app.use('/api/teams', teamsRouter);
+app.use('/api/admin', adminRouter);
+app.use('/api/events', eventsRouter);
+app.use('/api/sih', sihRouter);
+app.use('/api/aavishkar', aavishkarRouter);
+
+// 5. Start the Server
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`RIC backend listening on port ${PORT}`));
